@@ -1,3 +1,5 @@
+import { connect } from "cloudflare:sockets";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -676,6 +678,14 @@ async function handleContactForm(request, env, corsHeaders) {
       );
     }
 
+    if (!isValidEmail(email)) {
+      return jsonResponse(
+        { success: false, error: "Zadaj platny email." },
+        400,
+        corsHeaders
+      );
+    }
+
     const html =
       "<h2>Novy dopyt z formulara</h2>" +
       "<p><strong>Meno:</strong> " + escapeHtml(meno) + "</p>" +
@@ -683,21 +693,20 @@ async function handleContactForm(request, env, corsHeaders) {
       "<p><strong>Sprava:</strong></p>" +
       "<p>" + escapeHtml(sprava).replace(/\n/g, "<br>") + "</p>";
 
-    const resendResponse = await sendEmail(env, {
-      from: "formular@send.e-bazarik.sk",
-      to: "info@virivkyonline.sk",
+    const mailResponse = await sendEmail(env, {
+      to: env.ORDER_EMAIL || "info@virivkyonline.sk",
       reply_to: email,
       subject: "Novy kontaktny formular od: " + meno,
       html
     });
 
-    if (!resendResponse.ok) {
-      const resendText = await resendResponse.text();
+    if (!mailResponse.ok) {
+      const mailError = await mailResponse.text();
       return jsonResponse(
         {
           success: false,
           error: "Nepodarilo sa odoslat email.",
-          detail: resendText
+          detail: mailError
         },
         500,
         corsHeaders
@@ -741,6 +750,14 @@ async function handleOrder(request, env, corsHeaders) {
     if (!meno || !email || !phone || !street || !houseNumber || !zip || !city || items.length === 0) {
       return jsonResponse(
         { success: false, error: "Vypln vsetky povinne udaje a pridaj produkty do kosika." },
+        400,
+        corsHeaders
+      );
+    }
+
+    if (!isValidEmail(email)) {
+      return jsonResponse(
+        { success: false, error: "Zadaj platny email." },
         400,
         corsHeaders
       );
@@ -847,20 +864,19 @@ async function handleOrder(request, env, corsHeaders) {
       "<p style='margin-top:16px;'><strong>Celkom:</strong> " + total.toFixed(2) + " €</p>";
 
     const adminResponse = await sendEmail(env, {
-      from: "formular@send.e-bazarik.sk",
-      to: "info@virivkyonline.sk",
+      to: env.ORDER_EMAIL || "info@virivkyonline.sk",
       reply_to: email,
       subject: "Nova objednavka od: " + meno,
       html: adminHtml
     });
 
     if (!adminResponse.ok) {
-      const resendText = await adminResponse.text();
+      const mailError = await adminResponse.text();
       return jsonResponse(
         {
           success: false,
           error: "Nepodarilo sa odoslat objednavku.",
-          detail: resendText
+          detail: mailError
         },
         500,
         corsHeaders
@@ -868,19 +884,18 @@ async function handleOrder(request, env, corsHeaders) {
     }
 
     const customerResponse = await sendEmail(env, {
-      from: "formular@send.e-bazarik.sk",
       to: email,
       subject: "Potvrdenie objednavky - Platinum Lech Spa",
       html: customerHtml
     });
 
     if (!customerResponse.ok) {
-      const resendText = await customerResponse.text();
+      const mailError = await customerResponse.text();
       return jsonResponse(
         {
           success: false,
           error: "Objednavka prisla nam, ale kopia zakaznikovi sa nepodarila odoslat.",
-          detail: resendText
+          detail: mailError
         },
         500,
         corsHeaders
@@ -907,15 +922,201 @@ async function handleOrder(request, env, corsHeaders) {
   }
 }
 
+// Posiela email cez SMTP (napr. info@lech-web.sk). Nastavenia su v Cloudflare:
+// SMTP_HOST, SMTP_PORT (465 alebo 587), SMTP_USER, SMTP_PASS, volitelne SMTP_FROM, SMTP_FROM_NAME.
+// Vracia Response, aby volajuci mohli pouzit .ok a .text().
 async function sendEmail(env, payload) {
-  return fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": "Bearer " + env.RESEND_API_KEY,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
+  try {
+    await sendSmtpMail(env, payload);
+    return new Response("OK", { status: 200 });
+  } catch (e) {
+    return new Response("SMTP chyba: " + (e && e.message ? e.message : String(e)), { status: 502 });
+  }
+}
+
+const SMTP_TIMEOUT_MS = 20000;
+
+async function sendSmtpMail(env, payload) {
+  const host = String(env.SMTP_HOST || "").trim();
+  const port = parseInt(env.SMTP_PORT || "465", 10);
+  const user = String(env.SMTP_USER || "").trim();
+  const pass = String(env.SMTP_PASS || "");
+  const fromAddress = String(env.SMTP_FROM || user).trim();
+  const fromName = String(env.SMTP_FROM_NAME || "Platinum Lech Spa").trim();
+
+  if (!host || !user || !pass) {
+    throw new Error("SMTP nie je nastavene (chyba SMTP_HOST, SMTP_USER alebo SMTP_PASS).");
+  }
+
+  const recipients = (Array.isArray(payload.to) ? payload.to : [payload.to]).map(a => String(a || "").trim());
+  const replyTo = payload.reply_to ? String(payload.reply_to).trim() : "";
+
+  for (const address of [fromAddress, ...recipients, ...(replyTo ? [replyTo] : [])]) {
+    if (!isValidEmail(address)) {
+      throw new Error("Neplatna emailova adresa: " + address);
+    }
+  }
+
+  const message = buildMimeMessage({
+    fromName,
+    fromAddress,
+    recipients,
+    replyTo,
+    subject: payload.subject || "",
+    html: payload.html || ""
   });
+
+  const implicitTls = port === 465;
+  let socket = connect({ hostname: host, port }, { secureTransport: implicitTls ? "on" : "starttls" });
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("SMTP server neodpoveda.")), SMTP_TIMEOUT_MS);
+  });
+
+  const session = async () => {
+    const ehloName = fromAddress.split("@")[1];
+    let conn = smtpConnection(socket);
+
+    await conn.command(null, [220], "Pripojenie");
+    let ehlo = await conn.command("EHLO " + ehloName, [250], "EHLO");
+
+    if (!implicitTls) {
+      await conn.command("STARTTLS", [220], "STARTTLS");
+      conn.release();
+      socket = socket.startTls();
+      conn = smtpConnection(socket);
+      ehlo = await conn.command("EHLO " + ehloName, [250], "EHLO");
+    }
+
+    if (/AUTH[ =][^\n]*PLAIN/i.test(ehlo.text)) {
+      await conn.command("AUTH PLAIN " + base64Utf8("\u0000" + user + "\u0000" + pass), [235], "Prihlasenie");
+    } else {
+      await conn.command("AUTH LOGIN", [334], "Prihlasenie");
+      await conn.command(base64Utf8(user), [334], "Prihlasenie");
+      await conn.command(base64Utf8(pass), [235], "Prihlasenie");
+    }
+
+    await conn.command("MAIL FROM:<" + fromAddress + ">", [250], "MAIL FROM");
+    for (const address of recipients) {
+      await conn.command("RCPT TO:<" + address + ">", [250, 251], "RCPT TO " + address);
+    }
+    await conn.command("DATA", [354], "DATA");
+    await conn.command(message + "\r\n.", [250], "Odoslanie");
+
+    try {
+      await conn.command("QUIT", [221], "QUIT");
+    } catch (e) {
+      // Email uz bol prijaty, chyba pri QUIT nevadi.
+    }
+  };
+
+  try {
+    await Promise.race([session(), timeout]);
+  } finally {
+    clearTimeout(timer);
+    try {
+      socket.close();
+    } catch (e) {
+      // ignore
+    }
+  }
+}
+
+function smtpConnection(socket) {
+  const reader = socket.readable.getReader();
+  const writer = socket.writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  async function readReply() {
+    const lines = [];
+    while (true) {
+      const end = buffer.indexOf("\n");
+      if (end === -1) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("SMTP server ukoncil spojenie.");
+        buffer += decoder.decode(value, { stream: true });
+        continue;
+      }
+      const line = buffer.slice(0, end).replace(/\r$/, "");
+      buffer = buffer.slice(end + 1);
+      lines.push(line);
+      if (!/^\d{3}-/.test(line)) {
+        return { code: parseInt(line.slice(0, 3), 10), text: lines.join("\n") };
+      }
+    }
+  }
+
+  return {
+    async command(line, expectedCodes, label) {
+      if (line !== null) {
+        await writer.write(encoder.encode(line + "\r\n"));
+      }
+      const reply = await readReply();
+      if (!expectedCodes.includes(reply.code)) {
+        throw new Error(label + ": " + reply.text);
+      }
+      return reply;
+    },
+    release() {
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+  };
+}
+
+function buildMimeMessage({ fromName, fromAddress, recipients, replyTo, subject, html }) {
+  const headers = [
+    "From: " + encodeHeaderWord(fromName) + " <" + fromAddress + ">",
+    "To: " + recipients.map(a => "<" + a + ">").join(", ")
+  ];
+  if (replyTo) {
+    headers.push("Reply-To: <" + replyTo + ">");
+  }
+  headers.push(
+    "Subject: " + encodeHeaderWord(subject),
+    "Date: " + new Date().toUTCString(),
+    "Message-ID: <" + crypto.randomUUID() + "@" + fromAddress.split("@")[1] + ">",
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: base64"
+  );
+
+  const body = (base64Utf8(html).match(/.{1,76}/g) || []).join("\r\n");
+  return headers.join("\r\n") + "\r\n\r\n" + body;
+}
+
+// RFC 2047: kazdy kusok max. 45 bajtov UTF-8, aby riadok hlavicky nebol prilis dlhy.
+function encodeHeaderWord(text) {
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let current = "";
+  for (const char of String(text).replace(/[\r\n]+/g, " ")) {
+    if (current && encoder.encode(current + char).length > 45) {
+      chunks.push(current);
+      current = "";
+    }
+    current += char;
+  }
+  if (current || chunks.length === 0) {
+    chunks.push(current);
+  }
+  return chunks.map(chunk => "=?UTF-8?B?" + base64Utf8(chunk) + "?=").join("\r\n ");
+}
+
+function base64Utf8(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function isValidEmail(email) {
+  return email.length <= 254 &&
+    /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(email);
 }
 
 function jsonResponse(data, status, corsHeaders) {
