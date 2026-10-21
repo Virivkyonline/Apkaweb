@@ -2,6 +2,11 @@
   "name": "virivkyapp",
   "main": "Worker/worker.js",
   "compatibility_date": "2026-04-08",
+  "vars": {
+    "SMTP_HOST": "smtp.m1.websupport.sk",
+    "SMTP_PORT": "465",
+    "SMTP_USER": "info@lech-web.sk"
+  },
   "kv_namespaces": [
     {
       "binding": "APP_STATS",
